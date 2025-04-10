@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+import browser_cookie3
+import requests
+import json
+from pathlib import Path
+import tempfile
+import subprocess
+import shutil
+from mutagen.mp4 import MP4, MP4Cover
+import argparse
+from urllib.parse import urljoin
+from Crypto.Cipher import AES
+from io import BytesIO
+import re
+import os
+import time
+import random
+
+def save_tokens(data, filename="tokens.json"):
+    with open(filename, "w") as f:
+        json.dump(data, f)
+
+def load_tokens(filename="tokens.json"):
+    path = Path(filename)
+    if path.exists():
+        with open(path, "r") as f:
+            return json.load(f)
+    return None
+
+def auth():
+    if tokens:
+        print("Using saved tokens")
+        session.headers.update({
+            "Authorization": f"Bearer {tokens['access_token']}",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Referer": "https://www.beatport.com/",
+            "Origin": "https://www.beatport.com",
+            "Connection": "keep-alive",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        })
+    else:
+        print("Using Firefox cookies for auth")
+        cookies = browser_cookie3.firefox()
+        session.cookies.update(cookies)
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Referer": "https://www.beatport.com/",
+            "Origin": "https://www.beatport.com",
+            "Connection": "keep-alive",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        })
+        
+        auth_resp = session.get("https://www.beatport.com/api/auth/session")
+        if auth_resp.ok:
+            data = auth_resp.json()
+            save_tokens({
+                "access_token": data["token"]["accessToken"],
+                "refresh_token": data["token"]["refreshToken"]
+            })
+            session.headers.update({
+                "Authorization": f"Bearer {data["token"]["accessToken"]}"
+            })
+        else:
+            print("Auth failed:", auth_resp.status_code)
+
+def get_track(track_id):
+    release_url = f"https://api.beatport.com/v4/catalog/tracks/{track_id}"
+    api_response = session.get(release_url)
+    if api_response.status_code == 200:
+        response_json = api_response.json()
+        return response_json
+
+def get_track_stream(track_id):
+    url = f"https://api.beatport.com/v4/catalog/tracks/{track_id}/stream"
+    api_response = session.get(url)
+    if api_response.status_code == 200:
+        response_json = api_response.json()
+        return response_json
+
+def get_playlist_from_stream(stream, output_filename="output.aac"):
+    stream_url = stream['stream_url']
+    base_url = stream_url.rsplit('/', 1)[0] + "/"
+    
+    playlist_resp = session.get(stream_url)
+    playlist_resp.raise_for_status()
+    playlist_text = playlist_resp.text
+    lines = playlist_text.splitlines()
+
+    key_line = next(line for line in lines if line.startswith("#EXT-X-KEY"))
+    key_uri = re.search(r'URI="(.*?)"', key_line).group(1)
+    iv_hex = re.search(r'IV=0x([0-9a-fA-F]+)', key_line).group(1)
+    iv = bytes.fromhex(iv_hex)
+    
+    key_url = urljoin(base_url, key_uri)
+    key_resp = session.get(key_url)
+    key_resp.raise_for_status()
+    key = key_resp.content
+    
+    segment_files = [line for line in lines if line and not line.startswith("#")]
+    
+    download = download_with_progress(base_url=base_url,segments=segment_files, key=key, iv=iv)
+
+    return download
+
+def convert_aac_to_m4a(input_bytes, metadata, output_path, artwork_url=None):
+    with tempfile.NamedTemporaryFile(suffix=".aac", delete=False) as temp_in:
+        temp_in.write(input_bytes)
+        temp_in.flush()
+        temp_in_path = temp_in.name
+
+    temp_out = tempfile.NamedTemporaryFile(suffix=".m4a", delete=False)
+    temp_out_path = temp_out.name
+    temp_out.close()
+
+    try:
+        subprocess.run([
+            "ffmpeg", "-y", "-i", temp_in_path,
+            "-c:a", "copy",
+            temp_out_path
+        ], check=True)
+
+        audio = MP4(temp_out_path)
+        tag_map = {
+            "title": "\xa9nam",            
+            "artist": "\xa9ART",           
+            "album": "\xa9alb",            
+            "genre": "\xa9gen",            
+            "bpm": "tmpo",                 
+            "key": "\xa9key",              
+            "date": "\xa9day",             
+        }
+        for k, v in metadata.items():
+            tag = tag_map.get(k)
+            if not tag or v is None:
+                continue
+            audio[tag] = v if isinstance(v, list) else [v]
+
+        
+        if artwork_url:
+            img_data = requests.get(artwork_url).content
+            cover = MP4Cover(img_data, imageformat=MP4Cover.FORMAT_JPEG)
+            audio["covr"] = [cover]
+        audio.save()
+
+        shutil.move(temp_out_path, output_path)
+        print(f"[+] Final file saved as: {output_path}")
+
+    finally:
+        try:
+            os.remove(temp_in_path)
+        except OSError:
+            pass
+        try:
+            os.remove(temp_out_path)
+        except OSError:
+            pass
+               
+def format_track_metadata(track):
+    metadata = {
+    "title": f"{track['name']} ({track['mix_name']})" if track.get("mix_name") else track["name"],
+    "artist": [a["name"] for a in track.get("artists", [])],
+    "album": track["release"]["name"] if track.get("release") else None,
+    "genre": track["genre"]["name"] if track.get("genre") else None,
+    "bpm": track.get("bpm"),
+    "key": f"{track['key']['camelot_number']}{track['key']['camelot_letter']}" if track.get("key") else None,
+    "date": track.get("publish_date"),
+    "tracknumber": (track.get("number"), None),
+    "isrc": track.get("isrc"),
+    "length": track.get("length"),
+    "label": track["release"]["label"]["name"] if track.get("release") and track["release"].get("label") else None,
+    "catalog_number": track.get("catalog_number"),
+    }
+    return metadata
+
+def sanitize_filename(name):
+    return re.sub(r'[\\/*?:"<>|]', "", name)
+
+def build_save_dir(base_dir, metadata, track):
+    main_artist = sanitize_filename(metadata["artist"][0])
+    release_name = sanitize_filename(track["release"]["name"])
+    release_id = track["release"]["id"]
+
+    # Build folder and filename
+    output_dir = os.path.join(base_dir, main_artist, f"{release_name} [{release_id}]")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Final output path
+    track_title = sanitize_filename(metadata["title"])
+    output_path = os.path.join(output_dir, f"{track_title}.m4a")
+    return track_title, output_path
+
+def is_release_url(url):
+    return "/release/" in url
+
+def extract_id_from_url(url):
+    match = re.search(r'/(track|release)/[^/]+/(\d+)', url)
+    return match.group(2) if match else None
+
+def download_with_progress(base_url, segments, key, iv):
+    buffer = BytesIO()
+    total = len(segments)
+    for i, segment_file in enumerate(segments):
+        segment_url = urljoin(base_url, segment_file)
+        segment_resp = session.get(segment_url)
+        segment_resp.raise_for_status()
+        encrypted_data = segment_resp.content
+
+        cipher = AES.new(key, AES.MODE_CBC, iv)
+        decrypted = cipher.decrypt(encrypted_data)
+        if i == total - 1:
+            pad_len = decrypted[-1]
+            decrypted = decrypted[:-pad_len]
+        buffer.write(decrypted)
+
+        print(f"\rDownloading: {i+1}/{total} segments", end="", flush=True)
+    print()  # newline
+    return buffer.getvalue()
+
+def load_url_list(args):
+    urls = list(args.urls)
+    if args.batch_file:
+        with open(args.batch_file) as f:
+            file_urls = [line.strip() for line in f if line.strip()]
+            urls.extend(file_urls)
+    return urls
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        prog="beatportdl",
+        description="Download Beatport tracks/releases"
+    )
+    parser.add_argument(
+        "urls",
+        nargs="*",
+        help="One or more Beatport track or release URLs"
+    )
+    parser.add_argument(
+        "-o", "--output",
+        default=".",
+        help="Base output directory (default: current directory)"
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Always re-auth using browser cookies (don't cache tokens)"
+    )
+    parser.add_argument("-a", "--batch-file", help="File containing list of Beatport URLs (one per line)")
+    return parser.parse_args()
+
+def delay_before_track():
+    seconds = random.uniform(3, 7)
+    print(f"Sleeping {seconds:.1f}s before next track...")
+    time.sleep(seconds)
+
+def get_release_tracks(release_id):
+    url = f"https://api.beatport.com/v4/catalog/releases/{release_id}/tracks/"
+    resp = session.get(url)
+    return resp.json()["results"] if resp.ok else []
+
+def get_album_art_url(dynamic_uri, width=1400, height=1400):
+    return dynamic_uri.replace("{w}", str(width)).replace("{h}", str(height))
+
+if __name__ == "__main__":
+    args = parse_args()
+
+    if args.no_cache:
+        tokens = None
+    else:
+        tokens = load_tokens()
+        
+    session = requests.Session()
+    auth()
+    urls = load_url_list(args)
+    for url in urls:
+        is_release = is_release_url(url)
+        entity_id = extract_id_from_url(url)
+        if not entity_id:
+            print(f"Could not extract ID from {url}")
+            continue
+
+        tracks = get_release_tracks(entity_id) if is_release else [get_track(entity_id)]
+        
+        is_first_track = True
+        for track in tracks:
+            if not is_first_track:
+                delay_before_track()
+                is_first_track = False
+            metadata = format_track_metadata(track)
+            title, output_path = build_save_dir(args.output, metadata, track)
+            full_path = os.path.join(args.output, output_path)
+
+            if os.path.exists(full_path):
+                print(f"[✓] Skipping '{title}' (already exists)")
+                continue
+
+            artwork_url = get_album_art_url(track["release"]["image"]["dynamic_uri"])
+            stream = get_track_stream(track["id"])
+            if not stream:
+                print(f"Failed to get stream for track {track['name']}")
+                continue
+
+            aac_bytes = get_playlist_from_stream(stream)
+            convert_aac_to_m4a(aac_bytes, metadata, output_path=full_path, artwork_url=artwork_url)
+
