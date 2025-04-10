@@ -2,17 +2,5 @@
 urls
 tokens.json
 beatportdl.spec
-build/beatportdl/Analysis-00.toc
-build/beatportdl/base_library.zip
-build/beatportdl/beatportdl.pkg
-build/beatportdl/EXE-00.toc
-build/beatportdl/PKG-00.toc
-build/beatportdl/PYZ-00.pyz
-build/beatportdl/PYZ-00.toc
-build/beatportdl/warn-beatportdl.txt
-build/beatportdl/xref-beatportdl.html
-build/beatportdl/localpycs/pyimod01_archive.pyc
-build/beatportdl/localpycs/pyimod02_importers.pyc
-build/beatportdl/localpycs/pyimod03_ctypes.pyc
-build/beatportdl/localpycs/struct.pyc
-FISHER (OZ)/Stay \[4981845]/Stay (Extended Mix).m4a
+build/
+dist/
